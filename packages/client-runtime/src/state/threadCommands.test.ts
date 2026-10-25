@@ -1353,6 +1353,34 @@ describe("settle and snooze while the environment is offline", () => {
       }),
   );
 
+  it.effect("Undo asks the server for a change that replaced one whose reply was lost", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({ connected: false });
+      h.registry.mount(h.commands.pendingSyncAtom(ENVIRONMENT_ID));
+      yield* Effect.promise(() => h.commands.snooze.run(h.registry, snooze));
+      yield* h.reconnect();
+      const replay = yield* Queue.take(h.requests);
+      yield* h.disconnect;
+      yield* Deferred.fail(replay.reply, lostReply());
+      const later = {
+        ...snooze,
+        input: { ...snooze.input, snoozedUntil: "2099-02-01T00:00:00.000Z" },
+      };
+      yield* Effect.promise(() => h.commands.snooze.run(h.registry, later));
+      expect(stored(h.storage)).toMatchObject([
+        { action: { type: "snooze", snoozedUntil: later.input.snoozedUntil }, attempted: true },
+      ]);
+
+      const result = yield* Effect.promise(() =>
+        h.commands.unsnooze.run(h.registry, {
+          environmentId: ENVIRONMENT_ID,
+          input: { threadId: THREAD_ID, reason: "user" },
+        }),
+      );
+      expect(result._tag).toBe("Failure");
+    }),
+  );
+
   it.effect("does not send a queued change it cannot record as sent", () =>
     Effect.gen(function* () {
       const markFailed = yield* Deferred.make<void>();

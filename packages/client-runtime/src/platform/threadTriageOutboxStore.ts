@@ -53,8 +53,9 @@ export const sameThreadTriage = (a: ThreadTriageKey, b: ThreadTriageKey) =>
 export interface ThreadTriageOutboxStoreShape {
   readonly load: Effect.Effect<ThreadTriageOutboxDocument, ThreadTriageOutboxStorageError>;
   /**
-   * Replaces any entry for the same thread. `stillCurrent` runs inside the store's lock, after
-   * any earlier removal, so a write for a removed environment is skipped.
+   * Replaces any entry for the same thread, keeping its `attempted` mark. `stillCurrent` runs
+   * inside the store's lock, after any earlier removal, so a write for a removed environment is
+   * skipped.
    */
   readonly put: (
     entry: PendingThreadTriage,
@@ -150,17 +151,18 @@ export function makeThreadTriageOutboxStore(storage: {
   return {
     load: lock.withPermits(1)(load),
     put: (entry, stillCurrent) =>
-      update((document) =>
-        stillCurrent?.() === false
-          ? null
-          : {
-              ...document,
-              entries: [
-                ...document.entries.filter((current) => !sameThreadTriage(current, entry)),
-                entry,
-              ],
-            },
-      ),
+      update((document) => {
+        if (stillCurrent?.() === false) return null;
+        const replaced = document.entries.find((current) => sameThreadTriage(current, entry));
+        return {
+          ...document,
+          entries: [
+            ...document.entries.filter((current) => current !== replaced),
+            // The replaced change may have reached the server, so the server must undo this one.
+            replaced?.attempted === true ? { ...entry, attempted: true as const } : entry,
+          ],
+        };
+      }),
     remove: (entry) =>
       updateEntries((entries) =>
         entries.filter(
