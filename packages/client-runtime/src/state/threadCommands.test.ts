@@ -23,6 +23,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { Atom, AtomRegistry } from "effect/reactivity";
 import { RpcClientError } from "effect/rpc";
@@ -649,6 +650,67 @@ describe("settle and snooze while the environment is offline", () => {
         yield* Deferred.succeed(request.reply, { sequence: 2 });
         yield* waitFor(h.registry, pending, (threads) => threads.size === 0);
       }),
+  );
+
+  it.effect("replays a queued change when an Undo that failed lets go after reconnect", () =>
+    Effect.gen(function* () {
+      const cancelStarted = yield* Deferred.make<void>();
+      const cancelReleased = yield* Deferred.make<void>();
+      const h = yield* makeHarness({
+        connected: false,
+        wrapStore: (store) => ({
+          ...store,
+          cancel: () =>
+            Deferred.succeed(cancelStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(cancelReleased)),
+              Effect.andThen(
+                Effect.fail(new ThreadTriageOutboxStorageError({ cause: "disk full" })),
+              ),
+            ),
+        }),
+      });
+      h.registry.mount(h.commands.pendingSyncAtom(ENVIRONMENT_ID));
+      yield* Effect.promise(() => h.commands.settle.run(h.registry, settle));
+      const undo = h.commands.unsettle.run(h.registry, {
+        environmentId: ENVIRONMENT_ID,
+        input: { threadId: THREAD_ID, reason: "user" },
+      });
+      yield* Deferred.await(cancelStarted);
+      yield* h.reconnect();
+      yield* Deferred.succeed(cancelReleased, undefined);
+      expect((yield* Effect.promise(() => undo))._tag).toBe("Failure");
+      const request = yield* Queue.take(h.requests);
+      expect(request.command.type).toBe("thread.settle");
+    }),
+  );
+
+  it.effect("keeps every tab's change when a shared lock serializes their writes", () =>
+    Effect.gen(function* () {
+      const shared = { value: null as string | null };
+      const crossTab = Semaphore.makeUnsafe(1);
+      // Yields after reading, as another process's write can land before this one writes.
+      const makeTab = () =>
+        makeThreadTriageOutboxStore({
+          read: Effect.sync(() => shared.value).pipe(Effect.tap(() => Effect.yieldNow)),
+          write: (value) =>
+            Effect.sync(() => {
+              shared.value = value;
+            }),
+          exclusive: (effect) => crossTab.withPermits(1)(effect),
+        });
+      const change = (threadId: string) => ({
+        environmentId: ENVIRONMENT_ID,
+        threadId: ThreadId.make(threadId),
+        commandId: CommandId.make(`command-${threadId}`),
+        action: { type: "settle" as const },
+        queuedAt: NOW,
+        snapshotSequence: 1,
+      });
+      yield* Effect.all([makeTab().put(change("first")), makeTab().put(change("second"))], {
+        concurrency: "unbounded",
+      });
+      expect(stored(shared).map((entry) => entry.threadId)).toEqual(["first", "second"]);
+    }),
   );
 
   it.effect("restores a queued snooze after a restart and replays it once", () =>

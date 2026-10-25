@@ -274,6 +274,23 @@ export function createThreadTriageOutbox<R, E>(input: {
     return removed;
   };
 
+  /** Reconnect skips a claimed thread, so whoever releases one replays what is still queued. */
+  const release = (
+    registry: AtomRegistry.AtomRegistry,
+    key: ThreadTriageKey,
+    lifetime: { readonly ended: boolean },
+  ) => {
+    claimed.delete(keyOf(key));
+    if (
+      !lifetime.ended &&
+      input.shellStatusAtom !== undefined &&
+      registry.get(input.shellStatusAtom(key.environmentId)) === "live" &&
+      pendingFor(registry, key) !== undefined
+    ) {
+      void replay(registry, key.environmentId);
+    }
+  };
+
   const replayingEnvironments = new Set<EnvironmentId>();
   const replayAgain = new Set<EnvironmentId>();
   const replay = async (registry: AtomRegistry.AtomRegistry, environmentId: EnvironmentId) => {
@@ -457,18 +474,7 @@ export function createThreadTriageOutbox<R, E>(input: {
           ]);
           return AsyncResult.success({ sequence: snapshot.snapshotSequence, pendingSync: true });
         } finally {
-          if (owns) {
-            claimed.delete(claimKey);
-            // Reconnect may have skipped this thread while its queue write held the claim.
-            if (
-              !lifetime.ended &&
-              input.shellStatusAtom !== undefined &&
-              registry.get(input.shellStatusAtom(environmentId)) === "live" &&
-              pendingFor(registry, key) !== undefined
-            ) {
-              void replay(registry, environmentId);
-            }
-          }
+          if (owns) release(registry, key, lifetime);
         }
       },
     };
@@ -501,6 +507,7 @@ export function createThreadTriageOutbox<R, E>(input: {
           // A claimed entry may already be on its way; the server undoes it after it lands.
           return command.run(registry, target);
         }
+        const lifetime = registry.get(registryLifetimeAtom);
         claimed.add(claimKey);
         try {
           // Storage decides, because another tab or an earlier run may have sent it.
@@ -517,7 +524,7 @@ export function createThreadTriageOutbox<R, E>(input: {
           }
           return result;
         } finally {
-          claimed.delete(claimKey);
+          release(registry, pending, lifetime);
         }
       },
     };

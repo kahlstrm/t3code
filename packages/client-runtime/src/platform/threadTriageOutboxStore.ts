@@ -113,7 +113,10 @@ export class ThreadTriageOutboxStore extends Context.Reference<ThreadTriageOutbo
 export function makeThreadTriageOutboxStore(storage: {
   readonly read: Effect.Effect<string | null, ThreadTriageOutboxStorageError>;
   readonly write: (value: string) => Effect.Effect<void, ThreadTriageOutboxStorageError>;
+  /** Serializes each read-modify-write with other processes sharing the storage, such as tabs. */
+  readonly exclusive?: <A, E>(effect: Effect.Effect<A, E>) => Effect.Effect<A, E>;
 }): ThreadTriageOutboxStoreShape {
+  const exclusive = storage.exclusive ?? ((effect) => effect);
   const lock = Semaphore.makeUnsafe(1);
   const clearedListeners = new Set<(environmentId: EnvironmentId) => void>();
   const load = storage.read.pipe(
@@ -135,17 +138,19 @@ export function makeThreadTriageOutboxStore(storage: {
     after: Effect.Effect<void> = Effect.void,
   ) =>
     lock.withPermits(1)(
-      load.pipe(
-        Effect.flatMap((document) => {
-          const next = transform(document);
-          return next === null
-            ? Effect.void
-            : encodeStored(next).pipe(
-                Effect.mapError((cause) => new ThreadTriageOutboxStorageError({ cause })),
-                Effect.flatMap(storage.write),
-              );
-        }),
-        Effect.ensuring(after),
+      exclusive(
+        load.pipe(
+          Effect.flatMap((document) => {
+            const next = transform(document);
+            return next === null
+              ? Effect.void
+              : encodeStored(next).pipe(
+                  Effect.mapError((cause) => new ThreadTriageOutboxStorageError({ cause })),
+                  Effect.flatMap(storage.write),
+                );
+          }),
+          Effect.ensuring(after),
+        ),
       ),
     );
   const updateEntries = (

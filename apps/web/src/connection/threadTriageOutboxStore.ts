@@ -17,4 +17,11 @@ export const browserThreadTriageOutboxStore = makeThreadTriageOutboxStore({
       try: () => window.localStorage.setItem(STORAGE_KEY, value),
       catch: (cause) => new ThreadTriageOutboxStorageError({ cause }),
     }),
+  // Tabs in other processes share localStorage, and only a Web Lock serializes them.
+  exclusive: (effect) =>
+    typeof navigator === "undefined" || navigator.locks === undefined
+      ? effect
+      : Effect.promise(() =>
+          navigator.locks.request(STORAGE_KEY, () => Effect.runPromiseExit(effect)),
+        ).pipe(Effect.flatten),
 });
