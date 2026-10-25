@@ -48,6 +48,7 @@ type StoreOperation =
       readonly stillCurrent: () => boolean;
     }
   | { readonly _tag: "remove"; readonly entry: PendingThreadTriage }
+  | { readonly _tag: "markAttempted"; readonly entry: PendingThreadTriage }
   | {
       readonly _tag: "setOperable";
       readonly environmentId: EnvironmentId;
@@ -160,6 +161,16 @@ export function createThreadTriageOutbox<R, E>(input: {
             ),
           );
           return EMPTY_DOCUMENT;
+        case "markAttempted": {
+          const marked = yield* outbox.markAttempted(operation.entry).pipe(
+            Effect.tapError((error) =>
+              Effect.logWarning("Could not record an offline thread change as sent.", {
+                cause: String(error.cause),
+              }),
+            ),
+          );
+          return { ...EMPTY_DOCUMENT, entries: marked ? [operation.entry] : [] };
+        }
         case "setOperable":
           yield* outbox
             .setOperable(operation.environmentId, operation.operable, operation.stillCurrent)
@@ -172,6 +183,20 @@ export function createThreadTriageOutbox<R, E>(input: {
             );
           return EMPTY_DOCUMENT;
       }
+    }),
+  });
+
+  const cancelStored = createRuntimeCommand(input.runtime, {
+    label: "environment-data:thread-triage-outbox-cancel",
+    execute: Effect.fn("ThreadTriageOutbox.cancel")(function* (entry: PendingThreadTriage) {
+      const outbox = yield* ThreadTriageOutboxStore;
+      return yield* outbox.cancel(entry).pipe(
+        Effect.tapError((error) =>
+          Effect.logWarning("Could not cancel an offline thread change.", {
+            cause: String(error.cause),
+          }),
+        ),
+      );
     }),
   });
 
@@ -308,6 +333,13 @@ export function createThreadTriageOutbox<R, E>(input: {
         ) {
           await forget(registry, current);
           if (lifetime.ended) return;
+          continue;
+        }
+        // Recorded before sending, so an Undo after a lost reply or a restart asks the server.
+        const marked = await store.run(registry, { _tag: "markAttempted", entry: current });
+        if (lifetime.ended || !AsyncResult.isSuccess(marked)) return;
+        if (marked.value.entries.length === 0) {
+          setLocal(registry, (entries) => entries.filter((existing) => existing !== current));
           continue;
         }
         const result = await input.replay(registry, current);
@@ -480,11 +512,19 @@ export function createThreadTriageOutbox<R, E>(input: {
         }
         claimed.add(claimKey);
         try {
-          // A cancel that stays on disk would come back and replay after a restart.
-          const removed = await store.run(registry, { _tag: "remove", entry: pending });
-          if (!AsyncResult.isSuccess(removed)) return AsyncResult.failure(removed.cause);
-          setLocal(registry, (entries) => entries.filter((current) => current !== pending));
-          return AsyncResult.success(cancelledValue);
+          // Storage decides, because another tab or an earlier run may have sent it.
+          const outcome = await cancelStored.run(registry, pending);
+          if (!AsyncResult.isSuccess(outcome)) return AsyncResult.failure(outcome.cause);
+          if (outcome.value !== "attempted") {
+            setLocal(registry, (entries) => entries.filter((current) => current !== pending));
+          }
+          if (outcome.value === "cancelled") return AsyncResult.success(cancelledValue);
+          const result = await command.run(registry, target);
+          // The undo is newer on the server, which then rejects the queued change anyway.
+          if (AsyncResult.isSuccess(result) && pendingFor(registry, pending) === pending) {
+            await forget(registry, pending);
+          }
+          return result;
         } finally {
           claimed.delete(claimKey);
         }

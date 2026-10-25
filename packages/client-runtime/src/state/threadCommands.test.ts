@@ -25,6 +25,7 @@ import * as Queue from "effect/Queue";
 import * as Scope from "effect/Scope";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { Atom, AtomRegistry } from "effect/reactivity";
+import { RpcClientError } from "effect/rpc";
 
 import * as EnvironmentRegistry from "../connection/registry.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
@@ -1067,6 +1068,54 @@ describe("settle and snooze while the environment is offline", () => {
     }),
   );
 
+  /** The request may have reached the server before the socket closed. */
+  const lostReply = () =>
+    new RpcClientError.RpcClientError({
+      reason: new RpcClientError.RpcClientDefect({
+        message: "socket closed",
+        cause: new Error("socket closed"),
+      }),
+    });
+
+  it.effect("Undo after a replay lost its reply un-settles on the server", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({ connected: false });
+      const pending = h.commands.pendingSyncAtom(ENVIRONMENT_ID);
+      h.registry.mount(pending);
+      yield* Effect.promise(() => h.commands.settle.run(h.registry, settle));
+      yield* h.reconnect();
+      const replay = yield* Queue.take(h.requests);
+      // Waits behind the replay, so its request shows the replay has let go of the thread.
+      const behind = h.commands.unsnooze.run(h.registry, {
+        environmentId: ENVIRONMENT_ID,
+        input: { threadId: THREAD_ID, reason: "user" },
+      });
+      yield* Deferred.fail(replay.reply, lostReply());
+      const behindRequest = yield* Queue.take(h.requests);
+      yield* Deferred.succeed(behindRequest.reply, { sequence: 2 });
+      yield* Effect.promise(() => behind);
+      expect(h.registry.get(pending).has(THREAD_ID)).toBe(true);
+
+      const undo = h.commands.unsettle.run(h.registry, {
+        environmentId: ENVIRONMENT_ID,
+        input: { threadId: THREAD_ID, reason: "user" },
+      });
+      const sent = yield* Effect.raceFirst(
+        Queue.take(h.requests),
+        Effect.promise(() => undo).pipe(Effect.as("cancelled locally" as const)),
+      );
+      expect(sent).toMatchObject({ command: { type: "thread.unsettle" } });
+      if (sent === "cancelled locally") return;
+      yield* Deferred.succeed(sent.reply, { sequence: 3 });
+      const result = yield* Effect.promise(() => undo);
+      expect(result._tag === "Success" && ThreadUndo.cancelledPendingSync(result.value)).toBe(
+        false,
+      );
+      expect(h.registry.get(pending).size).toBe(0);
+      expect(stored(h.storage)).toEqual([]);
+    }),
+  );
+
   it.effect("queues the snapshot the action was taken against, not a later one", () =>
     Effect.gen(function* () {
       const loaded = yield* Deferred.make<void>();
@@ -1254,6 +1303,90 @@ describe("settle and snooze while the environment is offline", () => {
   const expireStoredSnooze = (storage: { value: string | null }) => {
     storage.value = storage.value!.replace("2099-01-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z");
   };
+
+  it.effect("Undo asks the server once another tab has sent the queued change", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({ connected: false });
+      h.registry.mount(h.commands.pendingSyncAtom(ENVIRONMENT_ID));
+      yield* Effect.promise(() => h.commands.settle.run(h.registry, settle));
+      const { tab, pending } = yield* otherTab(h.storage);
+      yield* tab.reconnect();
+      const replay = yield* Queue.take(tab.requests);
+      yield* Deferred.succeed(replay.reply, { sequence: 2 });
+      yield* waitFor(tab.registry, pending, (threads) => threads.size === 0);
+
+      // This tab is still offline, so the server Undo it needs cannot reach the server.
+      const result = yield* Effect.promise(() =>
+        h.commands.unsettle.run(h.registry, {
+          environmentId: ENVIRONMENT_ID,
+          input: { threadId: THREAD_ID, reason: "user" },
+        }),
+      );
+      expect(result._tag).toBe("Failure");
+    }),
+  );
+
+  it.effect.each([
+    ["settle", "unsettle"],
+    ["snooze", "unsnooze"],
+  ] as const)(
+    "Undo after a restart or in another tab asks the server once a %s replay lost its reply",
+    ([action, undo]) =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness({ connected: false });
+        h.registry.mount(h.commands.pendingSyncAtom(ENVIRONMENT_ID));
+        yield* Effect.promise(() => h.commands[action].run(h.registry, snooze));
+        yield* h.reconnect();
+        const replay = yield* Queue.take(h.requests);
+        yield* Deferred.fail(replay.reply, lostReply());
+        const { tab } = yield* otherTab(h.storage);
+
+        // Still offline here, so the server Undo it needs cannot reach the server.
+        const result = yield* Effect.promise(() =>
+          tab.commands[undo].run(tab.registry, {
+            environmentId: ENVIRONMENT_ID,
+            input: { threadId: THREAD_ID, reason: "user" },
+          }),
+        );
+        expect(result._tag).toBe("Failure");
+        expect(stored(h.storage)).toMatchObject([{ action: { type: action }, attempted: true }]);
+      }),
+  );
+
+  it.effect("does not send a queued change it cannot record as sent", () =>
+    Effect.gen(function* () {
+      const markFailed = yield* Deferred.make<void>();
+      let failMark = true;
+      const h = yield* makeHarness({
+        connected: false,
+        wrapStore: (store) => ({
+          ...store,
+          markAttempted: (entry) =>
+            failMark
+              ? Deferred.succeed(markFailed, undefined).pipe(
+                  Effect.andThen(
+                    Effect.fail(new ThreadTriageOutboxStorageError({ cause: "disk full" })),
+                  ),
+                )
+              : store.markAttempted(entry),
+        }),
+      });
+      yield* Effect.promise(() => h.commands.settle.run(h.registry, settle));
+      yield* h.reconnect();
+      const first = yield* Effect.raceFirst(
+        Deferred.await(markFailed).pipe(Effect.as("not sent" as const)),
+        Queue.take(h.requests).pipe(Effect.as("sent" as const)),
+      );
+      expect(first).toBe("not sent");
+      failMark = false;
+      // A second reconnect only replays after the first attempt finished.
+      yield* h.disconnect;
+      yield* h.reconnect();
+      const request = yield* Queue.take(h.requests);
+      expect(request.command.type).toBe("thread.settle");
+      expect(yield* Queue.size(h.requests)).toBe(0);
+    }),
+  );
 
   it.effect("judges expiry by the replacement another tab stored, not the cached change", () =>
     Effect.gen(function* () {

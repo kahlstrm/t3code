@@ -15,6 +15,8 @@ export const PendingThreadTriage = Schema.Struct({
   queuedAt: Schema.DateTimeUtcFromString,
   /** Shell sequence the action was taken against; the server rejects it after newer changes. */
   snapshotSequence: NonNegativeInt,
+  /** Set before the first send and never cleared: the server may have it, so only it can undo. */
+  attempted: Schema.optionalKey(Schema.Literal(true)),
 });
 export type PendingThreadTriage = typeof PendingThreadTriage.Type;
 
@@ -62,6 +64,17 @@ export interface ThreadTriageOutboxStoreShape {
   readonly remove: (
     entry: ThreadTriageKey & Pick<PendingThreadTriage, "commandId">,
   ) => Effect.Effect<void, ThreadTriageOutboxStorageError>;
+  /** Marks the entry as sent if it still has this command id; reports whether it did. */
+  readonly markAttempted: (
+    entry: ThreadTriageKey & Pick<PendingThreadTriage, "commandId">,
+  ) => Effect.Effect<boolean, ThreadTriageOutboxStorageError>;
+  /**
+   * Removes the entry only if it still has this command id and was never sent. Otherwise it
+   * reports whether the entry was sent or is gone, and leaves storage as it is.
+   */
+  readonly cancel: (
+    entry: ThreadTriageKey & Pick<PendingThreadTriage, "commandId">,
+  ) => Effect.Effect<"cancelled" | "attempted" | "gone", ThreadTriageOutboxStorageError>;
   readonly setOperable: (
     environmentId: EnvironmentId,
     operable: boolean,
@@ -154,6 +167,35 @@ export function makeThreadTriageOutboxStore(storage: {
           (current) => !sameThreadTriage(current, entry) || current.commandId !== entry.commandId,
         ),
       ),
+    markAttempted: (entry) =>
+      Effect.suspend(() => {
+        let found = false;
+        return update((document) => {
+          const stored = document.entries.find((current) => sameThreadTriage(current, entry));
+          found = stored?.commandId === entry.commandId;
+          if (!found || stored?.attempted === true) return null;
+          return {
+            ...document,
+            entries: document.entries.map((current) =>
+              current === stored ? { ...current, attempted: true as const } : current,
+            ),
+          };
+        }).pipe(Effect.map(() => found));
+      }),
+    cancel: (entry) =>
+      Effect.suspend(() => {
+        let outcome: "cancelled" | "attempted" | "gone" = "gone";
+        return update((document) => {
+          const stored = document.entries.find((current) => sameThreadTriage(current, entry));
+          if (stored?.commandId !== entry.commandId) return null;
+          if (stored.attempted === true) {
+            outcome = "attempted";
+            return null;
+          }
+          outcome = "cancelled";
+          return { ...document, entries: document.entries.filter((current) => current !== stored) };
+        }).pipe(Effect.map(() => outcome));
+      }),
     setOperable: (environmentId, operable, stillCurrent) =>
       update((document) =>
         stillCurrent?.() === false
