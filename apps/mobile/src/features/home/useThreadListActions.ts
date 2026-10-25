@@ -301,7 +301,7 @@ export function useThreadListActions(): {
                 case "snooze": {
                   const failureTitle =
                     action === "Unpinned" ? "Could not undo unpin" : "Could not undo settle";
-                  if (!checkThreadOperationPermission(thread, failureTitle)) return false;
+                  if (!checkThreadOperationPermission(thread, failureTitle, true)) return false;
                   const result = await snoozeMutation({
                     environmentId: thread.environmentId,
                     input: { threadId: thread.id, snoozedUntil: step.snoozedUntil },

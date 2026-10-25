@@ -144,7 +144,11 @@ vi.mock("../../state/threads", () => ({
           input: { threadId: string; orderKey?: string };
         }) => {
           state.requests.push({ action, ...request });
-          if (!state.scopes.get(request.environmentId)?.has(AuthOrchestrationOperateScope)) {
+          const triage = ["settle", "unsettle", "snooze", "unsnooze"].includes(action);
+          if (
+            !state.scopes.get(request.environmentId)?.has(AuthOrchestrationOperateScope) &&
+            !(triage && state.offlineTriage.has(request.environmentId))
+          ) {
             return AsyncResult.failure(Cause.fail(new Error("Thread operation denied")));
           }
           if (action === state.failedAction)
@@ -374,6 +378,24 @@ describe("thread action undo", () => {
       snoozedUntil: thread.snoozedUntil,
     });
     expect(readThreadUndoNotice()).toBeNull();
+  });
+
+  it("restores snooze with the remembered grant if the session disappears during Undo", async () => {
+    const thread = makeThread({ snoozedUntil: "2099-01-01T09:00:00.000Z" });
+    expect(await useThreadListActions().settleThread(thread)).toBe(true);
+    state.afterRequest = () => {
+      state.scopes.delete(primaryEnvironmentId);
+      state.offlineTriage.add(primaryEnvironmentId);
+    };
+
+    await readThreadUndoNotice()!.undo();
+
+    expect(state.requests.map(({ action }) => action)).toEqual(["settle", "unsettle", "snooze"]);
+    expect(state.requests.at(-1)?.input).toEqual({
+      threadId: thread.id,
+      snoozedUntil: thread.snoozedUntil,
+    });
+    expect(state.alerts).toEqual([]);
   });
 
   // Whether the queued settle reached the server is known only when Undo runs.
