@@ -41,6 +41,7 @@ type Command<I, E> = AtomCommand<
 
 type StoreOperation =
   | { readonly _tag: "load" }
+  | { readonly _tag: "read" }
   | {
       readonly _tag: "put";
       readonly entry: Omit<PendingThreadTriage, "commandId">;
@@ -133,6 +134,8 @@ export function createThreadTriageOutbox<R, E>(input: {
               }).pipe(Effect.as(EMPTY_DOCUMENT)),
             ),
           );
+        case "read":
+          return yield* outbox.load;
         case "put": {
           const crypto = yield* Crypto.Crypto;
           const entry = {
@@ -275,9 +278,24 @@ export function createThreadTriageOutbox<R, E>(input: {
           await forget(registry, entry);
           continue;
         }
-        const result = await input.replay(registry, entry);
+        // Another tab sharing the storage may have cancelled or replaced it.
+        const read = await store.run(registry, { _tag: "read" });
+        if (!AsyncResult.isSuccess(read)) return;
+        if (pendingFor(registry, entry) !== entry) continue;
+        const stored = read.value.entries.find((candidate) => sameThreadTriage(candidate, entry));
+        if (stored === undefined) {
+          setLocal(registry, (entries) => entries.filter((existing) => existing !== entry));
+          continue;
+        }
+        const current = stored.commandId === entry.commandId ? entry : stored;
+        if (current !== entry) {
+          setLocal(registry, (entries) =>
+            entries.map((existing) => (existing === entry ? current : existing)),
+          );
+        }
+        const result = await input.replay(registry, current);
         if (AsyncResult.isSuccess(result) || !isTransient(result.cause)) {
-          await forget(registry, entry);
+          await forget(registry, current);
         } else {
           return;
         }

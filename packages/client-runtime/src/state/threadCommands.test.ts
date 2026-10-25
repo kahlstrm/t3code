@@ -96,13 +96,17 @@ const SNAPSHOT: OrchestrationV2ShellSnapshot = {
   ],
 };
 
+let randomCalls = 0;
+
 const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* (options?: {
   readonly reconcilePendingWork?: (threadId: ThreadId) => Effect.Effect<void>;
   readonly connected?: boolean;
   readonly storage?: {
     value: string | null;
     failWrites?: boolean;
+    failReads?: boolean;
     writes?: Queue.Queue<string>;
+    reads?: Queue.Queue<void>;
   };
   readonly versionGuard?: boolean;
   readonly operateScope?: boolean | null;
@@ -141,7 +145,12 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* (optio
   } as EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
   const storage = options?.storage ?? { value: null };
   const store = makeThreadTriageOutboxStore({
-    read: Effect.sync(() => storage.value),
+    read: Effect.suspend(() => {
+      if (storage.reads) Queue.offerUnsafe(storage.reads, undefined);
+      return storage.failReads
+        ? Effect.fail(new ThreadTriageOutboxStorageError({ cause: "unreadable" }))
+        : Effect.succeed(storage.value);
+    }),
     write: (value) =>
       storage.failWrites
         ? Effect.fail(new ThreadTriageOutboxStorageError({ cause: "disk full" }))
@@ -159,7 +168,8 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* (optio
       Layer.succeed(
         Crypto.Crypto,
         Crypto.make({
-          randomBytes: (size) => new Uint8Array(size),
+          // Distinct bytes per call, so each queued change gets its own command id.
+          randomBytes: (size) => new Uint8Array(size).fill(++randomCalls % 256),
           digest: (_algorithm, data) => Effect.succeed(data),
         }),
       ),
@@ -1131,6 +1141,81 @@ describe("settle and snooze while the environment is offline", () => {
       // The server decides on replay; the newer action must not erase it locally.
       expect(h.registry.get(pending).has(THREAD_ID)).toBe(true);
       expect(stored(h.storage)).toMatchObject([{ action: { type: "settle" } }]);
+    }),
+  );
+
+  // Two browser tabs share one storage, but each keeps its own copy of the queue in memory.
+  const otherTab = (storage: { value: string | null }) =>
+    Effect.gen(function* () {
+      const tab = yield* makeHarness({ connected: false, storage });
+      const pending = tab.commands.pendingSyncAtom(ENVIRONMENT_ID);
+      tab.registry.mount(pending);
+      yield* waitFor(tab.registry, pending, (threads) => threads.has(THREAD_ID));
+      return { tab, pending };
+    });
+  const sentOrDropped = (
+    tab: Effect.Success<ReturnType<typeof makeHarness>>,
+    pending: Atom.Atom<ReadonlySet<ThreadId>>,
+  ) =>
+    Effect.raceFirst(
+      Queue.take(tab.requests).pipe(Effect.map((request) => request.command)),
+      waitFor(tab.registry, pending, (threads) => threads.size === 0).pipe(
+        Effect.as("dropped" as const),
+      ),
+    );
+
+  it.effect("does not replay a change another tab cancelled", () =>
+    Effect.gen(function* () {
+      const storage = { value: null as string | null };
+      const first = yield* makeHarness({ connected: false, storage });
+      yield* Effect.promise(() => first.commands.settle.run(first.registry, settle));
+      const { tab: second, pending } = yield* otherTab(storage);
+      const undo = yield* Effect.promise(() =>
+        first.commands.unsettle.run(first.registry, {
+          environmentId: ENVIRONMENT_ID,
+          input: { threadId: THREAD_ID, reason: "user" },
+        }),
+      );
+      expect(undo._tag).toBe("Success");
+      yield* second.reconnect();
+      expect(yield* sentOrDropped(second, pending)).toBe("dropped");
+      expect(second.registry.get(second.visibleAtom)).toBe(SNAPSHOT);
+    }),
+  );
+
+  it.effect("replays the change another tab queued in place of an older one", () =>
+    Effect.gen(function* () {
+      const storage = { value: null as string | null };
+      const first = yield* makeHarness({ connected: false, storage });
+      yield* Effect.promise(() => first.commands.settle.run(first.registry, settle));
+      const { tab: second, pending } = yield* otherTab(storage);
+      yield* Effect.promise(() => first.commands.snooze.run(first.registry, snooze));
+      const [replacement] = stored(storage);
+      yield* second.reconnect();
+      expect(yield* sentOrDropped(second, pending)).toMatchObject({
+        type: "thread.snooze",
+        commandId: replacement!.commandId,
+      });
+    }),
+  );
+
+  it.effect("does not replay when it cannot read the stored queue", () =>
+    Effect.gen(function* () {
+      const reads = yield* Queue.unbounded<void>();
+      const storage = { value: null as string | null, failReads: false, reads };
+      const first = yield* makeHarness({ connected: false, storage });
+      yield* Effect.promise(() => first.commands.settle.run(first.registry, settle));
+      const { tab: second, pending } = yield* otherTab(storage);
+      yield* Queue.clear(reads);
+      storage.failReads = true;
+      yield* second.reconnect();
+      yield* Queue.take(reads);
+      // A second reconnect only replays after the first attempt finished.
+      yield* second.disconnect;
+      yield* second.reconnect();
+      yield* Queue.take(reads);
+      expect(yield* Queue.size(second.requests)).toBe(0);
+      expect(second.registry.get(pending).has(THREAD_ID)).toBe(true);
     }),
   );
 });
