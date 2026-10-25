@@ -6,6 +6,18 @@ import * as Effect from "effect/Effect";
 
 const STORAGE_KEY = "t3code:thread-triage-outbox";
 
+/** Resolves with the release once the lock is granted, so the locked work runs on the caller's fiber. */
+const acquireLock = (locks: LockManager) =>
+  Effect.tryPromise({
+    try: () =>
+      new Promise<() => void>((granted, rejected) => {
+        locks
+          .request(STORAGE_KEY, () => new Promise<void>((release) => granted(() => release())))
+          .catch(rejected);
+      }),
+    catch: (cause) => new ThreadTriageOutboxStorageError({ cause }),
+  });
+
 /** Kept out of the environment cache so clearing cached data keeps unsynced settles and snoozes. */
 export const browserThreadTriageOutboxStore = makeThreadTriageOutboxStore({
   read: Effect.try({
@@ -25,8 +37,9 @@ export const browserThreadTriageOutboxStore = makeThreadTriageOutboxStore({
             cause: new Error("Offline thread changes require Web Locks. Use HTTPS or localhost."),
           }),
         )
-      : Effect.tryPromise({
-          try: () => navigator.locks.request(STORAGE_KEY, () => Effect.runPromiseExit(effect)),
-          catch: (cause) => new ThreadTriageOutboxStorageError({ cause }),
-        }).pipe(Effect.flatten),
+      : Effect.acquireUseRelease(
+          acquireLock(navigator.locks),
+          () => effect,
+          (release) => Effect.sync(release),
+        ),
 });
