@@ -17,6 +17,11 @@ import { useAtomCommand } from "./use-atom-command";
 export const ORCHESTRATION_OPERATE_DENIED_MESSAGE =
   "This connection cannot change threads or projects.";
 
+// Module scope: React Compiler cannot reorder an inline arrow used as a parameter default.
+function hasLiveOperateGrant(environmentId: EnvironmentId): boolean {
+  return readEnvironmentScope(environmentId, AuthOrchestrationOperateScope);
+}
+
 /**
  * `permitted` replaces the live operate check, so settle, snooze and their undo can pass the
  * remembered offline grant. It runs on every call, like the default.
@@ -24,8 +29,7 @@ export const ORCHESTRATION_OPERATE_DENIED_MESSAGE =
 export function useOrchestrationCommand<W extends { readonly environmentId: EnvironmentId }, A, E>(
   command: AtomCommand<W, A, E>,
   options?: string | AtomCommandOptions,
-  permitted: (environmentId: EnvironmentId) => boolean = (environmentId) =>
-    readEnvironmentScope(environmentId, AuthOrchestrationOperateScope),
+  permitted: (environmentId: EnvironmentId) => boolean = hasLiveOperateGrant,
 ): (value: W) => Promise<AtomCommandResult<A, E | EnvironmentAuthorizationError>> {
   const run = useAtomCommand(command, options);
   return async (value: W): Promise<AtomCommandResult<A, E | EnvironmentAuthorizationError>> => {
