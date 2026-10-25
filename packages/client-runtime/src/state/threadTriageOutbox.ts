@@ -41,14 +41,13 @@ type Command<I, E> = AtomCommand<
 
 type StoreOperation =
   | { readonly _tag: "load" }
-  | { readonly _tag: "read" }
   | {
       readonly _tag: "put";
       readonly entry: Omit<PendingThreadTriage, "commandId">;
       readonly stillCurrent: () => boolean;
     }
   | { readonly _tag: "remove"; readonly entry: PendingThreadTriage }
-  | { readonly _tag: "markAttempted"; readonly entry: PendingThreadTriage }
+  | { readonly _tag: "markAttempted"; readonly key: ThreadTriageKey }
   | {
       readonly _tag: "setOperable";
       readonly environmentId: EnvironmentId;
@@ -135,8 +134,6 @@ export function createThreadTriageOutbox<R, E>(input: {
               }).pipe(Effect.as(EMPTY_DOCUMENT)),
             ),
           );
-        case "read":
-          return yield* outbox.load;
         case "put": {
           const crypto = yield* Crypto.Crypto;
           const entry = {
@@ -162,14 +159,14 @@ export function createThreadTriageOutbox<R, E>(input: {
           );
           return EMPTY_DOCUMENT;
         case "markAttempted": {
-          const marked = yield* outbox.markAttempted(operation.entry).pipe(
+          const marked = yield* outbox.markAttempted(operation.key).pipe(
             Effect.tapError((error) =>
               Effect.logWarning("Could not record an offline thread change as sent.", {
                 cause: String(error.cause),
               }),
             ),
           );
-          return { ...EMPTY_DOCUMENT, entries: marked ? [operation.entry] : [] };
+          return { ...EMPTY_DOCUMENT, entries: marked === undefined ? [] : [marked] };
         }
         case "setOperable":
           yield* outbox
@@ -311,11 +308,12 @@ export function createThreadTriageOutbox<R, E>(input: {
       if (claimed.has(key)) continue;
       claimed.add(key);
       try {
-        // Another tab sharing the storage may have cancelled or replaced it.
-        const read = await store.run(registry, { _tag: "read" });
-        if (lifetime.ended || !AsyncResult.isSuccess(read)) return;
+        // Marked before sending, so an Undo after a lost reply, a restart, or in another tab asks
+        // the server. Storage also shows whether another tab cancelled or replaced the change.
+        const marked = await store.run(registry, { _tag: "markAttempted", key: entry });
+        if (lifetime.ended || !AsyncResult.isSuccess(marked)) return;
         if (pendingFor(registry, entry) !== entry) continue;
-        const stored = read.value.entries.find((candidate) => sameThreadTriage(candidate, entry));
+        const stored = marked.value.entries[0];
         if (stored === undefined) {
           setLocal(registry, (entries) => entries.filter((existing) => existing !== entry));
           continue;
@@ -333,13 +331,6 @@ export function createThreadTriageOutbox<R, E>(input: {
         ) {
           await forget(registry, current);
           if (lifetime.ended) return;
-          continue;
-        }
-        // Recorded before sending, so an Undo after a lost reply or a restart asks the server.
-        const marked = await store.run(registry, { _tag: "markAttempted", entry: current });
-        if (lifetime.ended || !AsyncResult.isSuccess(marked)) return;
-        if (marked.value.entries.length === 0) {
-          setLocal(registry, (entries) => entries.filter((existing) => existing !== current));
           continue;
         }
         const result = await input.replay(registry, current);

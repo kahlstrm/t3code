@@ -1389,14 +1389,14 @@ describe("settle and snooze while the environment is offline", () => {
         connected: false,
         wrapStore: (store) => ({
           ...store,
-          markAttempted: (entry) =>
+          markAttempted: (key) =>
             failMark
               ? Deferred.succeed(markFailed, undefined).pipe(
                   Effect.andThen(
                     Effect.fail(new ThreadTriageOutboxStorageError({ cause: "disk full" })),
                   ),
                 )
-              : store.markAttempted(entry),
+              : store.markAttempted(key),
         }),
       });
       yield* Effect.promise(() => h.commands.settle.run(h.registry, settle));

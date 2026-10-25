@@ -65,10 +65,13 @@ export interface ThreadTriageOutboxStoreShape {
   readonly remove: (
     entry: ThreadTriageKey & Pick<PendingThreadTriage, "commandId">,
   ) => Effect.Effect<void, ThreadTriageOutboxStorageError>;
-  /** Marks the entry as sent if it still has this command id; reports whether it did. */
+  /**
+   * Marks whatever is stored for the thread as sent and returns it, which may be another tab's
+   * replacement. Returns nothing when the thread has no stored change.
+   */
   readonly markAttempted: (
-    entry: ThreadTriageKey & Pick<PendingThreadTriage, "commandId">,
-  ) => Effect.Effect<boolean, ThreadTriageOutboxStorageError>;
+    key: ThreadTriageKey,
+  ) => Effect.Effect<PendingThreadTriage | undefined, ThreadTriageOutboxStorageError>;
   /**
    * Removes the entry only if it still has this command id and was never sent. Otherwise it
    * reports whether the entry was sent or is gone, and leaves storage as it is.
@@ -169,20 +172,23 @@ export function makeThreadTriageOutboxStore(storage: {
           (current) => !sameThreadTriage(current, entry) || current.commandId !== entry.commandId,
         ),
       ),
-    markAttempted: (entry) =>
+    markAttempted: (key) =>
       Effect.suspend(() => {
-        let found = false;
+        let marked: PendingThreadTriage | undefined;
         return update((document) => {
-          const stored = document.entries.find((current) => sameThreadTriage(current, entry));
-          found = stored?.commandId === entry.commandId;
-          if (!found || stored?.attempted === true) return null;
+          const stored = document.entries.find((current) => sameThreadTriage(current, key));
+          if (stored === undefined) return null;
+          if (stored.attempted === true) {
+            marked = stored;
+            return null;
+          }
+          const next = { ...stored, attempted: true as const };
+          marked = next;
           return {
             ...document,
-            entries: document.entries.map((current) =>
-              current === stored ? { ...current, attempted: true as const } : current,
-            ),
+            entries: document.entries.map((current) => (current === stored ? next : current)),
           };
-        }).pipe(Effect.map(() => found));
+        }).pipe(Effect.map(() => marked));
       }),
     cancel: (entry) =>
       Effect.suspend(() => {
