@@ -618,6 +618,38 @@ describe("settle and snooze while the environment is offline", () => {
     }),
   );
 
+  it.effect.each(["settle", "snooze"] as const)(
+    "replays a %s when reconnect finishes during the queue write",
+    (action) =>
+      Effect.gen(function* () {
+        const putStarted = yield* Deferred.make<void>();
+        const putReleased = yield* Deferred.make<void>();
+        const h = yield* makeHarness({
+          connected: false,
+          wrapStore: (store) => ({
+            ...store,
+            put: (entry, stillCurrent) =>
+              Deferred.succeed(putStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(putReleased)),
+                Effect.andThen(store.put(entry, stillCurrent)),
+              ),
+          }),
+        });
+        const pending = h.commands.pendingSyncAtom(ENVIRONMENT_ID);
+        h.registry.mount(pending);
+        const queued = h.commands[action].run(h.registry, snooze);
+        yield* Deferred.await(putStarted);
+        yield* h.reconnect();
+        yield* Deferred.succeed(putReleased, undefined);
+        expect((yield* Effect.promise(() => queued))._tag).toBe("Success");
+        const request = yield* Queue.take(h.requests);
+        expect(request.command.type).toBe(`thread.${action}`);
+        expect(request.command.commandId).toBe(stored(h.storage)[0]!.commandId);
+        yield* Deferred.succeed(request.reply, { sequence: 2 });
+        yield* waitFor(h.registry, pending, (threads) => threads.size === 0);
+      }),
+  );
+
   it.effect("restores a queued snooze after a restart and replays it once", () =>
     Effect.gen(function* () {
       const storage = { value: null as string | null };

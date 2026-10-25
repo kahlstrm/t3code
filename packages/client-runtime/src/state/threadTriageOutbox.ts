@@ -372,6 +372,7 @@ export function createThreadTriageOutbox<R, E>(input: {
         const { environmentId } = target;
         const key = { environmentId, threadId: target.input.threadId };
         const claimKey = keyOf(key);
+        const lifetime = registry.get(registryLifetimeAtom);
         // A replay already holding the thread finishes first; the scheduler runs this after it.
         const owns = !claimed.has(claimKey);
         if (owns) claimed.add(claimKey);
@@ -433,7 +434,18 @@ export function createThreadTriageOutbox<R, E>(input: {
           ]);
           return AsyncResult.success({ sequence: snapshot.snapshotSequence, pendingSync: true });
         } finally {
-          if (owns) claimed.delete(claimKey);
+          if (owns) {
+            claimed.delete(claimKey);
+            // Reconnect may have skipped this thread while its queue write held the claim.
+            if (
+              !lifetime.ended &&
+              input.shellStatusAtom !== undefined &&
+              registry.get(input.shellStatusAtom(environmentId)) === "live" &&
+              pendingFor(registry, key) !== undefined
+            ) {
+              void replay(registry, environmentId);
+            }
+          }
         }
       },
     };
