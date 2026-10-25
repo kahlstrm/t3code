@@ -343,13 +343,21 @@ export function createThreadTriageOutbox<R, E>(input: {
         // The server compares against what the user saw when acting, not what arrives later.
         const snapshot = registry.get(input.sourceSnapshotAtom(environmentId));
         const thread = snapshot?.threads.find((candidate) => candidate.id === key.threadId);
+        const superseded = pendingFor(registry, key);
         try {
           // Started before any await so the optimistic change shows in the same frame.
           const result = await command.run(registry, target);
           if (AsyncResult.isSuccess(result)) {
-            // The server now has a newer action, which a queued one would only fight.
-            const previous = owns ? pendingFor(registry, key) : undefined;
-            if (previous !== undefined) await forget(registry, previous);
+            // The server now has a newer action, which the change it replaced would only fight.
+            // A change queued after this one started stays, and one a replay holds is left to it.
+            const previous = pendingFor(registry, key);
+            if (
+              previous !== undefined &&
+              previous === superseded &&
+              (owns || !claimed.has(claimKey))
+            ) {
+              await forget(registry, previous);
+            }
             return result;
           }
           const offline = offlineError(result.cause);

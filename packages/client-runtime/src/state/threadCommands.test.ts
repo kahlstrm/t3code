@@ -28,6 +28,7 @@ import { Atom, AtomRegistry } from "effect/reactivity";
 
 import * as EnvironmentRegistry from "../connection/registry.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
+import { EnvironmentRpcUnavailableError } from "../rpc/client.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import type { EnvironmentShellStatus } from "./shell.ts";
 import { createThreadEnvironmentAtoms } from "./threadCommands.ts";
@@ -1070,6 +1071,66 @@ describe("settle and snooze while the environment is offline", () => {
       expect(JSON.parse(yield* Queue.take(writes)).operableEnvironmentIds).toEqual([
         ENVIRONMENT_ID,
       ]);
+    }),
+  );
+
+  it.effect("drops a queued change once a newer action reaches the server behind its replay", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({ connected: false });
+      const pending = h.commands.pendingSyncAtom(ENVIRONMENT_ID);
+      h.registry.mount(pending);
+      yield* Effect.promise(() => h.commands.settle.run(h.registry, settle));
+      yield* h.reconnect();
+      const replay = yield* Queue.take(h.requests);
+      expect(replay.command.type).toBe("thread.settle");
+      // Starts while the replay still holds the thread, so it waits behind it.
+      const newer = h.commands.snooze.run(h.registry, snooze);
+      yield* Deferred.fail(
+        replay.reply,
+        new EnvironmentRpcUnavailableError({
+          environmentId: ENVIRONMENT_ID,
+          message: "Mac is not connected.",
+        }),
+      );
+      const request = yield* Queue.take(h.requests);
+      expect(request.command.type).toBe("thread.snooze");
+      yield* Deferred.succeed(request.reply, { sequence: 2 });
+      expect((yield* Effect.promise(() => newer))._tag).toBe("Success");
+      expect(h.registry.get(pending).size).toBe(0);
+      expect(stored(h.storage)).toEqual([]);
+    }),
+  );
+
+  it.effect("keeps a change queued while a newer action was reaching the server", () =>
+    Effect.gen(function* () {
+      const putStarted = yield* Deferred.make<void>();
+      const putReleased = yield* Deferred.make<void>();
+      const h = yield* makeHarness({
+        connected: false,
+        wrapStore: (store) => ({
+          ...store,
+          put: (entry, stillCurrent) =>
+            Deferred.succeed(putStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(putReleased)),
+              Effect.andThen(store.put(entry, stillCurrent)),
+            ),
+        }),
+      });
+      const pending = h.commands.pendingSyncAtom(ENVIRONMENT_ID);
+      h.registry.mount(pending);
+      const queued = h.commands.settle.run(h.registry, settle);
+      yield* Deferred.await(putStarted);
+      yield* h.reconnect("synchronizing");
+      const online = h.commands.snooze.run(h.registry, snooze);
+      const request = yield* Queue.take(h.requests);
+      // The queued change lands while the newer action is still on its way.
+      yield* Deferred.succeed(putReleased, undefined);
+      expect((yield* Effect.promise(() => queued))._tag).toBe("Success");
+      yield* Deferred.succeed(request.reply, { sequence: 2 });
+      expect((yield* Effect.promise(() => online))._tag).toBe("Success");
+      // The server decides on replay; the newer action must not erase it locally.
+      expect(h.registry.get(pending).has(THREAD_ID)).toBe(true);
+      expect(stored(h.storage)).toMatchObject([{ action: { type: "settle" } }]);
     }),
   );
 });
