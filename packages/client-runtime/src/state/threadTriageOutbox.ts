@@ -230,13 +230,25 @@ export function createThreadTriageOutbox<R, E>(input: {
     const document = registry.get(documentAtom) ?? EMPTY_DOCUMENT;
     registry.set(documentAtom, { ...document, entries: transform(document.entries) });
   };
+  /** Ends with the registry, so replay stops touching it once the app or a test tears it down. */
+  const registryLifetimeAtom = Atom.make((get) => {
+    const lifetime = { ended: false };
+    get.addFinalizer(() => {
+      lifetime.ended = true;
+    });
+    return lifetime;
+  }).pipe(Atom.keepAlive);
+
   /**
    * Hides the entry even if storage keeps it: a restart then replays it with the same command
    * id, which the server deduplicates or rejects. Cancelling must check the result instead.
    */
   const forget = async (registry: AtomRegistry.AtomRegistry, entry: PendingThreadTriage) => {
+    const lifetime = registry.get(registryLifetimeAtom);
     const removed = await store.run(registry, { _tag: "remove", entry });
-    setLocal(registry, (entries) => entries.filter((current) => current !== entry));
+    if (!lifetime.ended) {
+      setLocal(registry, (entries) => entries.filter((current) => current !== entry));
+    }
     return removed;
   };
 
@@ -247,12 +259,14 @@ export function createThreadTriageOutbox<R, E>(input: {
       replayAgain.add(environmentId);
       return;
     }
+    const lifetime = registry.get(registryLifetimeAtom);
     replayingEnvironments.add(environmentId);
     try {
-      await replayEntries(registry, environmentId);
+      await replayEntries(registry, environmentId, lifetime);
     } finally {
       replayingEnvironments.delete(environmentId);
     }
+    if (lifetime.ended) return;
     if (replayAgain.delete(environmentId) && input.shellStatusAtom !== undefined) {
       if (registry.get(input.shellStatusAtom(environmentId)) === "live") {
         await replay(registry, environmentId);
@@ -262,6 +276,7 @@ export function createThreadTriageOutbox<R, E>(input: {
   const replayEntries = async (
     registry: AtomRegistry.AtomRegistry,
     environmentId: EnvironmentId,
+    lifetime: { readonly ended: boolean },
   ) => {
     for (const { threadId } of registry.get(environmentEntriesAtom(environmentId))) {
       // Earlier replies may have let Undo, a replacement, or a removal change this entry.
@@ -271,16 +286,9 @@ export function createThreadTriageOutbox<R, E>(input: {
       if (claimed.has(key)) continue;
       claimed.add(key);
       try {
-        if (
-          entry.action.type === "snooze" &&
-          !(Date.parse(entry.action.snoozedUntil) > DateTime.toEpochMillis(DateTime.nowUnsafe()))
-        ) {
-          await forget(registry, entry);
-          continue;
-        }
         // Another tab sharing the storage may have cancelled or replaced it.
         const read = await store.run(registry, { _tag: "read" });
-        if (!AsyncResult.isSuccess(read)) return;
+        if (lifetime.ended || !AsyncResult.isSuccess(read)) return;
         if (pendingFor(registry, entry) !== entry) continue;
         const stored = read.value.entries.find((candidate) => sameThreadTriage(candidate, entry));
         if (stored === undefined) {
@@ -293,9 +301,20 @@ export function createThreadTriageOutbox<R, E>(input: {
             entries.map((existing) => (existing === entry ? current : existing)),
           );
         }
+        // Expiry belongs to the change actually sent, which may be another tab's replacement.
+        if (
+          current.action.type === "snooze" &&
+          !(Date.parse(current.action.snoozedUntil) > DateTime.toEpochMillis(DateTime.nowUnsafe()))
+        ) {
+          await forget(registry, current);
+          if (lifetime.ended) return;
+          continue;
+        }
         const result = await input.replay(registry, current);
+        if (lifetime.ended) return;
         if (AsyncResult.isSuccess(result) || !isTransient(result.cause)) {
           await forget(registry, current);
+          if (lifetime.ended) return;
         } else {
           return;
         }

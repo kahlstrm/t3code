@@ -1218,4 +1218,39 @@ describe("settle and snooze while the environment is offline", () => {
       expect(second.registry.get(pending).has(THREAD_ID)).toBe(true);
     }),
   );
+
+  const expireStoredSnooze = (storage: { value: string | null }) => {
+    storage.value = storage.value!.replace("2099-01-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z");
+  };
+
+  it.effect("judges expiry by the replacement another tab stored, not the cached change", () =>
+    Effect.gen(function* () {
+      const storage = { value: null as string | null };
+      const first = yield* makeHarness({ connected: false, storage });
+      yield* Effect.promise(() => first.commands.snooze.run(first.registry, snooze));
+      expireStoredSnooze(storage);
+      const { tab: second, pending } = yield* otherTab(storage);
+      yield* Effect.promise(() => first.commands.settle.run(first.registry, settle));
+      const [replacement] = stored(storage);
+      yield* second.reconnect();
+      expect(yield* sentOrDropped(second, pending)).toMatchObject({
+        type: "thread.settle",
+        commandId: replacement!.commandId,
+      });
+    }),
+  );
+
+  it.effect("drops a replacement another tab stored once its snooze expired", () =>
+    Effect.gen(function* () {
+      const storage = { value: null as string | null };
+      const first = yield* makeHarness({ connected: false, storage });
+      yield* Effect.promise(() => first.commands.settle.run(first.registry, settle));
+      const { tab: second, pending } = yield* otherTab(storage);
+      yield* Effect.promise(() => first.commands.snooze.run(first.registry, snooze));
+      expireStoredSnooze(storage);
+      yield* second.reconnect();
+      expect(yield* sentOrDropped(second, pending)).toBe("dropped");
+      expect(stored(storage)).toEqual([]);
+    }),
+  );
 });
