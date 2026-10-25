@@ -17,11 +17,16 @@ export const browserThreadTriageOutboxStore = makeThreadTriageOutboxStore({
       try: () => window.localStorage.setItem(STORAGE_KEY, value),
       catch: (cause) => new ThreadTriageOutboxStorageError({ cause }),
     }),
-  // Tabs in other processes share localStorage, and only a Web Lock serializes them.
+  // Reject writes without cross-tab exclusion so shared localStorage changes cannot be lost.
   exclusive: (effect) =>
     typeof navigator === "undefined" || navigator.locks === undefined
-      ? effect
-      : Effect.promise(() =>
-          navigator.locks.request(STORAGE_KEY, () => Effect.runPromiseExit(effect)),
-        ).pipe(Effect.flatten),
+      ? Effect.fail(
+          new ThreadTriageOutboxStorageError({
+            cause: new Error("Offline thread changes require Web Locks. Use HTTPS or localhost."),
+          }),
+        )
+      : Effect.tryPromise({
+          try: () => navigator.locks.request(STORAGE_KEY, () => Effect.runPromiseExit(effect)),
+          catch: (cause) => new ThreadTriageOutboxStorageError({ cause }),
+        }).pipe(Effect.flatten),
 });

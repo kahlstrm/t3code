@@ -114,7 +114,9 @@ export function makeThreadTriageOutboxStore(storage: {
   readonly read: Effect.Effect<string | null, ThreadTriageOutboxStorageError>;
   readonly write: (value: string) => Effect.Effect<void, ThreadTriageOutboxStorageError>;
   /** Serializes each read-modify-write with other processes sharing the storage, such as tabs. */
-  readonly exclusive?: <A, E>(effect: Effect.Effect<A, E>) => Effect.Effect<A, E>;
+  readonly exclusive?: <A, E>(
+    effect: Effect.Effect<A, E>,
+  ) => Effect.Effect<A, E | ThreadTriageOutboxStorageError>;
 }): ThreadTriageOutboxStoreShape {
   const exclusive = storage.exclusive ?? ((effect) => effect);
   const lock = Semaphore.makeUnsafe(1);
@@ -149,9 +151,8 @@ export function makeThreadTriageOutboxStore(storage: {
                   Effect.flatMap(storage.write),
                 );
           }),
-          Effect.ensuring(after),
         ),
-      ),
+      ).pipe(Effect.ensuring(after)),
     );
   const updateEntries = (
     transform: (entries: ReadonlyArray<PendingThreadTriage>) => ReadonlyArray<PendingThreadTriage>,
